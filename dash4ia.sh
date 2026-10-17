@@ -12,6 +12,7 @@ set -u
 # ---------------------------------------------------------------------------
 # Configuración por defecto (sobrescribible por variables de entorno)
 # ---------------------------------------------------------------------------
+VERSION="1.1"
 INTERVAL="${DASH4IA_INTERVAL:-2}"
 MODE="${DASH4IA_MODE:-full}"   # full | simple
 ONCE=0
@@ -28,9 +29,11 @@ while [ $# -gt 0 ]; do
             MODE="simple"; shift ;;
         -1|--once)
             ONCE=1; shift ;;
+        -V|--version)
+            echo "dash4ia v${VERSION}"; exit 0 ;;
         -h|--help)
-            echo "dash4ia - Monitor de recursos para IA local"
-            echo "Uso: $0 [-i SEG] [-s|--simple] [-1|--once] [-h|--help]"
+            echo "dash4ia v${VERSION} - Monitor de recursos para IA local"
+            echo "Uso: $0 [-i SEG] [-s|--simple] [-1|--once] [-V|--version] [-h|--help]"
             exit 0 ;;
         *)
             echo "Opción desconocida: $1" >&2
@@ -39,10 +42,11 @@ while [ $# -gt 0 ]; do
 done
 
 # ---------------------------------------------------------------------------
-# Colores base (estilo dash4me)
+# Colores y estilos (ANSI: se ven igual en cualquier terminal)
 # ---------------------------------------------------------------------------
 RESET=$'\033[0m'
-NEGRITA=$'\033[1m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
 VERDE_BRILLANTE=$'\033[92m'
 VERDE=$'\033[32m'
 AMARILLO=$'\033[33m'
@@ -55,7 +59,6 @@ CIAN_BRILLANTE=$'\033[96m'
 ROJO=$'\033[31m'
 ROJO_BRILLANTE=$'\033[91m'
 BLANCO=$'\033[97m'
-GRIS_CLARO=$'\033[0;90m'
 
 # Alias en inglés (el resto del script usa RED, GREEN, BLUE, etc.)
 RED="$ROJO"
@@ -63,46 +66,11 @@ GREEN="$VERDE"
 YELLOW="$AMARILLO"
 BLUE="$AZUL"
 CYAN="$CIAN"
-WHITE="$BLANCO"
 MAGENTA="$AMARILLO_BRILLANTE"
 
-# Colores para GPU y térmicos
-VERDE_GPU=$'\033[38;5;47m'
-AMARILLO_GPU=$'\033[38;5;226m'
-ROJO_GPU=$'\033[38;5;209m'
-CIAN_GPU=$'\033[38;5;94m'
-AZUL_GRISACEO=$'\033[38;5;244m'
-
-# Colores tput (para bordes y barras) - inicializar vacías por set -u
-BOLD='' DIM='' TPUT_RESET='' TPUT_RED='' TPUT_GREEN='' TPUT_YELLOW='' TPUT_BLUE='' TPUT_MAGENTA='' TPUT_CYAN='' TPUT_WHITE=''
-CIVIS='' CNORM=''
-
-if command -v tput >/dev/null 2>&1 && [ -t 1 ] && [ "$MODE" != "simple" ]; then
-    BOLD=$(tput bold)
-    DIM=$(tput dim)
-    TPUT_RESET=$(tput sgr0)
-    TPUT_RED=$(tput setaf 1)
-    TPUT_GREEN=$(tput setaf 2)
-    TPUT_YELLOW=$(tput setaf 3)
-    TPUT_BLUE=$(tput setaf 4)
-    TPUT_MAGENTA=$(tput setaf 5)
-    TPUT_CYAN=$(tput setaf 6)
-    TPUT_WHITE=$(tput setaf 7)
-    CIVIS=$(tput civis 2>/dev/null)
-    CNORM=$(tput cnorm 2>/dev/null)
-fi
-
-# Para compatibilidad con el resto del script que usa $RESET, $RED, etc.
-if [ "$MODE" != "simple" ] && command -v tput >/dev/null 2>&1 && [ -t 1 ]; then
-    RESET="$TPUT_RESET"
-    RED="$TPUT_RED"
-    GREEN="$TPUT_GREEN"
-    YELLOW="$TPUT_YELLOW"
-    BLUE="$TPUT_BLUE"
-    MAGENTA="$TPUT_MAGENTA"
-    CYAN="$TPUT_CYAN"
-    WHITE="$TPUT_WHITE"
-fi
+# tput solo se usa para restaurar el cursor al salir
+CNORM=''
+command -v tput >/dev/null 2>&1 && CNORM=$(tput cnorm 2>/dev/null)
 
 cleanup() {
     [ -n "$CNORM" ] && tput cnorm 2>/dev/null
@@ -110,54 +78,31 @@ cleanup() {
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
-# Colores rotativos estilo dash4me (según segundos)
+# Colores aleatorios estilo dash4me (mezcla de paletas)
 # ---------------------------------------------------------------------------
-colores_rotativos() {
-    local segundos="$1"
-    local ultimo_digito="${segundos: -1}"
-    case "$ultimo_digito" in
-        1) COLOR_LOGO="$AZUL_BRILLANTE" ;;
-        2) COLOR_LOGO="$VERDE_BRILLANTE" ;;
-        3) COLOR_LOGO="$AMARILLO_BRILLANTE" ;;
-        4) COLOR_LOGO="$CIAN_BRILLANTE" ;;
-        5) COLOR_LOGO="$ROJO_BRILLANTE" ;;
-        6) COLOR_LOGO="$AZUL_CLARO" ;;
-        7) COLOR_LOGO="$VERDE" ;;
-        8) COLOR_LOGO="$AMARILLO" ;;
-        9) COLOR_LOGO="$CIAN" ;;
-        0) COLOR_LOGO="$ROJO" ;;
-        *) COLOR_LOGO="$BLANCO" ;;
-    esac
+# Paletas disponibles; se mezclan para elegir cada parte del logo al azar
+PALETA_BRILLANTE=("$AZUL_BRILLANTE" "$VERDE_BRILLANTE" "$AMARILLO_BRILLANTE" "$CIAN_BRILLANTE" "$ROJO_BRILLANTE" "$AZUL_CLARO")
+PALETA_ESTANDAR=("$VERDE" "$AMARILLO" "$AZUL" "$CIAN" "$ROJO" "$MAGENTA")
+PALETA_LOGO=("${PALETA_BRILLANTE[@]}" "${PALETA_ESTANDAR[@]}")
 
-    local digito_ver=$(( (10#$segundos + 5) % 10 ))
-    case "$digito_ver" in
-        1) COLOR_VER="$ROJO_BRILLANTE" ;;
-        2) COLOR_VER="$CIAN" ;;
-        3) COLOR_VER="$VERDE" ;;
-        4) COLOR_VER="$AMARILLO" ;;
-        5) COLOR_VER="$AZUL_BRILLANTE" ;;
-        6) COLOR_VER="$VERDE_BRILLANTE" ;;
-        7) COLOR_VER="$AMARILLO_BRILLANTE" ;;
-        8) COLOR_VER="$CIAN_BRILLANTE" ;;
-        9) COLOR_VER="$AZUL_CLARO" ;;
-        0) COLOR_VER="$BLANCO" ;;
-        *) COLOR_VER="$CIAN" ;;
-    esac
+# color_aleatorio -> devuelve un color al azar de la paleta completa
+color_aleatorio() {
+    local n=${#PALETA_LOGO[@]}
+    printf '%s' "${PALETA_LOGO[$((RANDOM % n))]}"
+}
 
-    local digito_dash=$(( (10#$segundos + 2) % 10 ))
-    case "$digito_dash" in
-        1) COLOR_DASH="$VERDE_BRILLANTE" ;;
-        2) COLOR_DASH="$AMARILLO_BRILLANTE" ;;
-        3) COLOR_DASH="$CIAN_BRILLANTE" ;;
-        4) COLOR_DASH="$ROJO_BRILLANTE" ;;
-        5) COLOR_DASH="$AZUL_CLARO" ;;
-        6) COLOR_DASH="$VERDE" ;;
-        7) COLOR_DASH="$AMARILLO" ;;
-        8) COLOR_DASH="$CIAN" ;;
-        9) COLOR_DASH="$ROJO" ;;
-        0) COLOR_DASH="$BLANCO" ;;
-        *) COLOR_DASH="$GRIS_CLARO" ;;
-    esac
+# Asigna un color aleatorio e independiente a cada parte del logo:
+#   COLOR_LOGO -> "dash4ia"
+#   COLOR_FULL -> "full dashboard"
+#   COLOR_VER  -> versión (v 1.1)
+#   COLOR_RAYO -> "⚡"
+#   COLOR_DASH -> líneas y separadores
+colores_aleatorios() {
+    COLOR_LOGO=$(color_aleatorio)
+    COLOR_FULL=$(color_aleatorio)
+    COLOR_VER=$(color_aleatorio)
+    COLOR_RAYO=$(color_aleatorio)
+    COLOR_DASH=$(color_aleatorio)
 }
 
 # ---------------------------------------------------------------------------
@@ -256,7 +201,7 @@ read_load() {
     local load cpus
     load=$(awk '{printf "%s %s %s", $1, $2, $3}' /proc/loadavg)
     cpus=$(nproc 2>/dev/null || echo '?')
-    echo "${load} ${cpus}"
+    echo "${cpus} ${load}"
 }
 
 # --- Temperatura CPU (sysfs + sensors) ---
@@ -381,13 +326,12 @@ term_width() {
 }
 
 draw_header() {
-    local now w segundos
+    local now w
     now=$(date '+%d/%m/%Y %H:%M:%S')
-    segundos=$(date +"%S")
     w=$(term_width)
 
-    # Calcular colores rotativos estilo dash4me
-    colores_rotativos "$segundos"
+    # Colores aleatorios para cada parte del logo
+    colores_aleatorios
 
     if [ "$MODE" = "simple" ]; then
         echo "=== dash4ia | $now | host: $HOSTNAME_VAL | interval: ${INTERVAL}s ==="
@@ -396,12 +340,12 @@ draw_header() {
 
     # Línea superior estilo dash4me
     printf '%s%s%s\n' "$COLOR_DASH" "─$(printf '─%.0s' $(seq 1 $((w-2))))" "$RESET"
-    printf '%s %s%sDASH4IA%s %s| %sFULL DASHBOARD%s %s| %sV 1.0%s %s: %s%s%s %s⚡%s\n' \
-        "$COLOR_DASH" "$COLOR_LOGO" "$NEGRITA" "$RESET" "$COLOR_DASH" "$COLOR_VER" "$RESET" "$COLOR_DASH" "$COLOR_VER" "$RESET" "$COLOR_DASH" "$BLANCO" "$now" "$RESET" "$COLOR_DASH" "$RESET"
+    printf '%s %s%sDASH4IA%s %s| %sFULL DASHBOARD%s %s| %sV %s%s %s: %s%s%s %s⚡%s\n' \
+        "$COLOR_DASH" "$COLOR_LOGO" "$BOLD" "$RESET" "$COLOR_DASH" "$COLOR_FULL" "$RESET" "$COLOR_DASH" "$COLOR_VER" "$VERSION" "$RESET" "$COLOR_DASH" "$BLANCO" "$now" "$RESET" "$COLOR_RAYO" "$RESET"
     printf '%s%s%s\n' "$COLOR_DASH" "─$(printf '─%.0s' $(seq 1 $((w-2))))" "$RESET"
 
-    printf '%s   %sAUTO-REFRESCO:%s %s s%s | %sENTER:%s Actualizar%s | %sCTRL+C:%s Salir%s\n' \
-        "$COLOR_DASH" "$RESET" "$CIAN" "$INTERVAL" "$RESET" "$CIAN" "$RESET" "$CIAN" "$RESET" "$CIAN" "$RESET"
+    printf '%s   %sAUTO-REFRESCO:%s %s s%s  |  %sCTRL+C:%s Salir%s\n' \
+        "$COLOR_DASH" "$RESET" "$CIAN" "$INTERVAL" "$RESET" "$CIAN" "$RESET" "$RESET"
 }
 
 draw_cpu() {
@@ -508,16 +452,16 @@ draw_temperatures() {
         printf '  %sCPU:%s %s%s°C%s\n' "$tcol" "$RESET" "$tcol" "$cpu_temp" "$RESET"
         if [ "$GPU_TYPE" != "NONE" ] && [ "$GPU_TEMP" -gt 0 ] 2>/dev/null; then
             tcol=$(color_por_umbral "$GPU_TEMP" 80 65)
-            printf '  %sGPU %s:%s %s%s°C%s\n' "$tcol" "$RESET" "$tcol" "$GPU_TEMP" "$RESET" "$GPU_TYPE"
+            printf '  %sGPU:%s %s%s°C%s\n' "$tcol" "$RESET" "$tcol" "$GPU_TEMP" "$RESET"
         fi
         printf '%s%s%s\n' "$BOLD$RED" "└─────────────────────────────" "$RESET"
     fi
 }
 
 draw_load() {
-    local load_str cpus w
-    read -r load_str cpus <<< "$(read_load)"
-    w=$(term_width)
+    local load_str cpus l1 l5 l15
+    read -r cpus l1 l5 l15 <<< "$(read_load)"
+    load_str="$l1 $l5 $l15"
     if [ "$MODE" = "simple" ]; then
         echo "--- Carga (load avg 1/5/15 min, CPUs) ---"
         echo "  $load_str  (CPUs: $cpus)"
@@ -586,19 +530,15 @@ draw_processes() {
 }
 
 draw_footer() {
-    local w pad info
+    local w info
     if [ "$MODE" = "simple" ]; then
         echo "=== fin de muestra ==="
         return
     fi
     w=$(term_width)
-    info=" Ctrl+C para salir  |  dash4ia — monitor de IA local "
-    pad_len=$(( w - 4 - ${#info} ))
-    [ "$pad_len" -lt 0 ] && pad_len=0
-    pad=$(printf ' %.0s' $(seq 1 $pad_len))
-    printf '%s║%s%s%s%s%s%s\n' \
-        "$BOLD$CYAN" "$DIM" "$info" "$RESET" "$pad" "$BOLD$CYAN" "$RESET"
-    printf '%s%s%s\n' "$BOLD$CYAN" "╚$(printf '═%.0s' $(seq 1 $((w-2))))╝" "$RESET"
+    info=" Ctrl+C para salir  |  dash4ia v${VERSION} — monitor de IA local"
+    printf '%s%s%s\n' "$DIM" "$info" "$RESET"
+    printf '%s%s%s\n' "$COLOR_DASH" "─$(printf '─%.0s' $(seq 1 $((w-2))))" "$RESET"
 }
 
 # ---------------------------------------------------------------------------
