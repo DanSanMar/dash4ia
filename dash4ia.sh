@@ -6,6 +6,19 @@
 # carga del sistema y los 3 procesos principales (destacando los de IA).
 #
 # Diseñado para no parpadear ni montar líneas entre actualizaciones.
+#
+# Copyright (C) 2026 DanSanMar
+#
+# Este programa es software libre: puedes redistribuirlo y/o modificarlo bajo
+# los términos de la GNU General Public License tal como la publica la Free
+# Software Foundation, ya sea la versión 3 de la Licencia o (a tu elección)
+# cualquier versión posterior.
+#
+# Se distribuye con la esperanza de que sea útil, pero SIN NINGUNA GARANTÍA;
+# ni siquiera la garantía implícita de COMERCIABILIDAD o IDONEIDAD PARA UN
+# PROPÓSITO PARTICULAR. Consulta la GNU General Public License para más
+# detalles. Deberías haber recibido una copia junto con este programa; si no,
+# consulta <https://www.gnu.org/licenses/>.
 ###############################################################################
 set -u
 
