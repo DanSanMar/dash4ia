@@ -4,18 +4,26 @@ Monitor de recursos de terminal, en un único script Bash, pensado para vigilar
 **cargas de IA en local** (LLMs, difusión, etc.): uso de CPU y su temperatura,
 memoria RAM, GPU/VRAM y los procesos que más CPU consumen.
 
-![versión](https://img.shields.io/badge/versión-1.2-blue)
+![versión](https://img.shields.io/badge/versión-1.3-blue)
 ![licencia](https://img.shields.io/badge/licencia-GPL--3.0--or--later-green)
 
 ## Características
 
-- **CPU**: uso total y temperatura, con barra y color según umbral.
-- **RAM**: memoria usada / total y memoria disponible.
+- **Barras uniformes (modo `full`)**: todas las métricas con barra comparten
+  el mismo formato — etiqueta, valor, barra de ancho fijo (igual para todas) y
+  los datos numéricos alineados en una columna al final. El ancho de barra se
+  ajusta al terminal para no partir líneas.
+- **CPU**: uso total, temperatura y carga (`load avg`) con barra, y el uso de
+  cada núcleo en porcentaje (rejilla con la media alineada con los valores de
+  uso, coloreada por umbral y adaptable al ancho).
+- **Memoria**: RAM y swap, cada una con su barra y el detalle usada / total.
 - **GPU / VRAM**: NVIDIA (vía `nvidia-smi`), AMD e Intel (vía `/sys`).
-  Muestra uso de GPU, VRAM usada / total / disponible, temperatura y
-  ventilador (en RPM, o en % si el driver solo expone el ciclo de trabajo).
-- **Carga del sistema**: `load avg` de 1/5/15 min y número de CPUs.
-- **Procesos**: los 3 que más CPU consumen, destacando los de IA con `[IA]`.
+  Muestra potencia, uso de GPU, VRAM (usada / total), frecuencia, temperatura y
+  ventilador (barra con el % de giro y las RPM como dato); los datos que el
+  driver no exponga salen como `n/d`.
+- **Procesos**: los 3 que más CPU consumen, destacando los de IA con `[IA]`,
+  más un resumen de procesos de IA (nº activos y CPU/RAM acumuladas).
+- **Cabecera** con hora y *uptime* del sistema.
 - **Dos modos**: `full` (pantalla alternativa, sin parpadeo) y `simple`
   (texto plano, ideal para terminales no interactivas o tuberías).
 - **Sin dependencias obligatorias**: si falta una utilidad, esa sección se
@@ -78,7 +86,8 @@ Los flags de línea de comandos tienen prioridad sobre las variables de entorno.
 - La detección de "procesos de IA" es heurística: busca ciertos patrones en el
   nombre del proceso (`ollama`, `llama`, `vllm`, `comfy`, `python`, etc.).
 - Las GPUs AMD/Intel se leen vía `sysfs`; en algunos equipos puede no haber
-  datos de VRAM o de ventilador, en cuyo caso se muestra `n/d`.
+  datos de VRAM, ventilador, frecuencia o potencia, en cuyo caso se muestra
+  `n/d`.
 
 ## Licencia
 

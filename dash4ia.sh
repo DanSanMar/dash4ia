@@ -25,7 +25,7 @@ set -u
 # ---------------------------------------------------------------------------
 # Configuración por defecto (sobrescribible por variables de entorno)
 # ---------------------------------------------------------------------------
-VERSION="1.2"
+VERSION="1.3"
 INTERVAL="${DASH4IA_INTERVAL:-2}"
 MODE="${DASH4IA_MODE:-full}"   # full | simple
 ONCE=0
@@ -47,6 +47,10 @@ while [ $# -gt 0 ]; do
         -h|--help)
             echo "dash4ia v${VERSION} - Monitor de recursos para IA local"
             echo "Uso: $0 [-i SEG] [-s|--simple] [-1|--once] [-V|--version] [-h|--help]"
+            echo ""
+            echo "  -i, --interval SEG   Segundos entre refrescos (por defecto ${INTERVAL})"
+            echo "  -s, --simple        Modo compacto en texto plano: una línea por métrica"
+            echo "  -1, --once          Un solo frame y sale (no entra en bucle)"
             exit 0 ;;
         *)
             echo "Opción desconocida: $1" >&2
@@ -81,9 +85,10 @@ BLUE="$AZUL"
 CYAN="$CIAN"
 MAGENTA="$AMARILLO_BRILLANTE"
 
-# tput solo se usa para restaurar el cursor al salir
+# tput solo se usa para restaurar el cursor al salir (solo en modo full;
+# en modo simple no se toca la terminal para no ensuciar tuberías)
 CNORM=''
-command -v tput >/dev/null 2>&1 && CNORM=$(tput cnorm 2>/dev/null)
+[ "$MODE" = "full" ] && command -v tput >/dev/null 2>&1 && CNORM=$(tput cnorm 2>/dev/null)
 
 cleanup() {
     [ -n "$CNORM" ] && tput cnorm 2>/dev/null
@@ -161,27 +166,31 @@ color_por_umbral() {
     else echo "$GREEN"; fi
 }
 
+# round_num <texto> -> primer número del texto redondeado a entero, o vacío
+# (sirve para valores tipo "143.45" o "N/A" de nvidia-smi)
+round_num() {
+    awk -v s="$1" 'BEGIN{
+        if (match(s, /[0-9]+(\.[0-9]+)?/)) printf "%d", substr(s, RSTART, RLENGTH)+0
+    }'
+}
+
 # ---------------------------------------------------------------------------
 # Lecturas de hardware
 # ---------------------------------------------------------------------------
 
-# --- CPU total (dos muestras de /proc/stat para calcular %) ---
-read_cpu_total() {
-    local s1 s2 t1_idle t1_total t2_idle t2_total dt di
-    s1=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5+$6}' /proc/stat)
+# --- CPU: uso total y por núcleo en una sola ventana de muestreo ---
+# Salida: 1ª línea = % total; siguientes = % de cada núcleo (en orden)
+read_cpu() {
+    local s1 s2
+    s1=$(awk '/^cpu[0-9]* /{ print $2+$3+$4+$5+$6+$7+$8, $5+$6 }' /proc/stat)
     sleep 0.3
-    s2=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5+$6}' /proc/stat)
-    t1_total=$(echo "$s1" | awk '{print $1}')
-    t1_idle=$(echo "$s1" | awk '{print $2}')
-    t2_total=$(echo "$s2" | awk '{print $1}')
-    t2_idle=$(echo "$s2" | awk '{print $2}')
-    dt=$(( t2_total - t1_total ))
-    di=$(( t2_idle - t1_idle ))
-    if [ "$dt" -gt 0 ]; then
-        awk -v dt="$dt" -v di="$di" 'BEGIN{ pct=(1-di/dt)*100; if(pct<0)pct=0; if(pct>100)pct=100; printf "%d", pct }'
-    else
-        echo 0
-    fi
+    s2=$(awk '/^cpu[0-9]* /{ print $2+$3+$4+$5+$6+$7+$8, $5+$6 }' /proc/stat)
+    paste <(printf '%s\n' "$s1") <(printf '%s\n' "$s2") | awk '
+        {
+            dt=$3-$1; di=$4-$2
+            if (dt>0) { p=(1-di/dt)*100; if(p<0)p=0; if(p>100)p=100 } else p=0
+            printf "%d\n", p+0.5
+        }'
 }
 
 # --- RAM ---
@@ -209,12 +218,42 @@ read_ram() {
     echo "${mem_total} ${mem_available} ${mem_used} ${mem_pct}"
 }
 
+# --- Swap (KiB): total, usada, % ---
+read_swap() {
+    local total free used pct
+    total=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)
+    free=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
+    total=${total:-0}
+    free=${free:-0}
+    used=$(( total - free ))
+    [ "$used" -lt 0 ] && used=0
+    if [ "$total" -gt 0 ]; then
+        pct=$(( used * 100 / total ))
+    else
+        pct=0
+    fi
+    echo "${total} ${used} ${pct}"
+}
+
 # --- Carga del sistema ---
 read_load() {
     local load cpus
     load=$(awk '{printf "%s %s %s", $1, $2, $3}' /proc/loadavg)
     cpus=$(nproc 2>/dev/null || echo '?')
     echo "${cpus} ${load}"
+}
+
+# --- Uptime en texto corto: "3d 4h", "4h 12m" o "12m" ---
+read_uptime() {
+    local up d h m
+    up=$(awk '{printf "%d", $1}' /proc/uptime)
+    up=${up:-0}
+    d=$(( up / 86400 ))
+    h=$(( (up % 86400) / 3600 ))
+    m=$(( (up % 3600) / 60 ))
+    if [ "$d" -gt 0 ]; then printf '%dd %dh' "$d" "$h"
+    elif [ "$h" -gt 0 ]; then printf '%dh %dm' "$h" "$m"
+    else printf '%dm' "$m"; fi
 }
 
 # --- Temperatura CPU (sysfs + sensors) ---
@@ -246,24 +285,34 @@ obtener_datos_gpu() {
     GPU_MODEL="No detectada"
     GPU_TEMP=0
     GPU_FAN_STR=""
+    GPU_FAN_PCT=""
     GPU_MEM_USED_MB=0
     GPU_MEM_TOTAL_MB=0
     GPU_UTIL=0
+    GPU_POWER_W=""
+    GPU_POWER_MAX_W=""
+    GPU_FREQ_MHZ=""
+    GPU_FREQ_MAX_MHZ=""
 
     # 1. NVIDIA
     if have nvidia-smi; then
         local n_out rc=0
-        n_out=$(nvidia-smi --query-gpu=name,temperature.gpu,fan.speed,memory.used,memory.total,utilization.gpu \
+        n_out=$(nvidia-smi --query-gpu=name,temperature.gpu,fan.speed,memory.used,memory.total,utilization.gpu,power.draw,power.limit,clocks.sm,clocks.max.sm \
             --format=csv,noheader,nounits 2>&1) || rc=$?
         if [ $rc -eq 0 ] && [ -n "$n_out" ] && ! echo "$n_out" | grep -qiE 'failed|could not|unable|not found|error'; then
-            IFS=',' read -r g_model g_temp g_fan g_used g_tot g_util <<< "$n_out"
+            IFS=',' read -r g_model g_temp g_fan g_used g_tot g_util g_pow g_powmax g_clock g_clockmax <<< "$n_out"
             GPU_TYPE="NVIDIA"
             GPU_MODEL=$(echo "$g_model" | xargs)
             GPU_TEMP=$(echo "$g_temp" | tr -dc '0-9')
             GPU_FAN_STR="$(echo "$g_fan" | tr -dc '0-9')%"
+            GPU_FAN_PCT=$(echo "$g_fan" | tr -dc '0-9')
             GPU_MEM_USED_MB=$(echo "$g_used" | tr -dc '0-9')
             GPU_MEM_TOTAL_MB=$(echo "$g_tot" | tr -dc '0-9')
             GPU_UTIL=$(echo "$g_util" | tr -dc '0-9')
+            GPU_POWER_W=$(round_num "$g_pow")
+            GPU_POWER_MAX_W=$(round_num "$g_powmax")
+            GPU_FREQ_MHZ=$(round_num "$g_clock")
+            GPU_FREQ_MAX_MHZ=$(round_num "$g_clockmax")
             : "${GPU_TEMP:=0}" "${GPU_MEM_USED_MB:=0}" "${GPU_MEM_TOTAL_MB:=0}" "${GPU_UTIL:=0}"
             return
         fi
@@ -289,22 +338,47 @@ obtener_datos_gpu() {
             fi
             [ -f "$card/device/gpu_busy_percent" ] && GPU_UTIL=$(cat "$card/device/gpu_busy_percent" 2>/dev/null | tr -dc '0-9')
             if [ -d "$card/device/hwmon" ]; then
-                local hwmon_dir fan_rpm pwm pwm_max
+                local hwmon_dir fan_rpm fan_max pwm pwm_max
                 hwmon_dir=$(ls -d "$card/device/hwmon/hwmon"* 2>/dev/null | head -n 1)
                 if [ -n "$hwmon_dir" ]; then
                     [ -f "$hwmon_dir/temp1_input" ] && GPU_TEMP=$(( $(cat "$hwmon_dir/temp1_input" 2>/dev/null) / 1000 ))
-                    # Fan: RPM si el driver lo expone; si no, % de duty (pwm1)
+                    # Fan: RPM si el driver lo expone y, si hay fan1_max, se deduce
+                    # el % de giro de las RPM (más fiable que pwm1 en modo auto)
                     if [ -f "$hwmon_dir/fan1_input" ]; then
                         fan_rpm=$(cat "$hwmon_dir/fan1_input" 2>/dev/null | tr -dc '0-9')
                         [ -n "$fan_rpm" ] && GPU_FAN_STR="${fan_rpm} RPM"
                     fi
-                    if [ -z "$GPU_FAN_STR" ] && [ -f "$hwmon_dir/pwm1" ]; then
+                    [ -f "$hwmon_dir/fan1_max" ] && fan_max=$(cat "$hwmon_dir/fan1_max" 2>/dev/null | tr -dc '0-9')
+                    if [ -n "$fan_rpm" ] && [ "${fan_max:-0}" -gt 0 ] 2>/dev/null; then
+                        GPU_FAN_PCT=$(( fan_rpm * 100 / fan_max ))
+                    fi
+                    # Sin RPM: se usa el ciclo de trabajo (pwm1)
+                    if [ -z "$GPU_FAN_PCT" ] && [ -f "$hwmon_dir/pwm1" ]; then
                         pwm=$(cat "$hwmon_dir/pwm1" 2>/dev/null | tr -dc '0-9')
                         pwm_max=$(cat "$hwmon_dir/pwm1_max" 2>/dev/null | tr -dc '0-9')
                         : "${pwm_max:=255}"
-                        [ -n "$pwm" ] && [ "$pwm_max" -gt 0 ] && GPU_FAN_STR="$(( pwm * 100 / pwm_max ))%"
+                        if [ -n "$pwm" ] && [ "${pwm_max:-0}" -gt 0 ]; then
+                            GPU_FAN_PCT=$(( pwm * 100 / pwm_max ))
+                            [ -z "$GPU_FAN_STR" ] && GPU_FAN_STR="${GPU_FAN_PCT}%"
+                        fi
+                    fi
+                    # Potencia en µW -> W (best-effort)
+                    if [ -f "$hwmon_dir/power1_average" ]; then
+                        local pow_uw
+                        pow_uw=$(cat "$hwmon_dir/power1_average" 2>/dev/null | tr -dc '0-9')
+                        [ -n "$pow_uw" ] && GPU_POWER_W=$(( pow_uw / 1000000 ))
+                    fi
+                    if [ -f "$hwmon_dir/power1_cap" ]; then
+                        local cap_uw
+                        cap_uw=$(cat "$hwmon_dir/power1_cap" 2>/dev/null | tr -dc '0-9')
+                        [ -n "$cap_uw" ] && GPU_POWER_MAX_W=$(( cap_uw / 1000000 ))
                     fi
                 fi
+            fi
+            # Frecuencia actual y máxima (MHz) vía pp_dpm_sclk (la actual va con '*')
+            if [ -f "$card/device/pp_dpm_sclk" ]; then
+                GPU_FREQ_MHZ=$(grep '\*' "$card/device/pp_dpm_sclk" 2>/dev/null | grep -oE '[0-9]+[Mm]hz' | head -n1 | tr -dc '0-9')
+                GPU_FREQ_MAX_MHZ=$(grep -oE '[0-9]+[Mm]hz' "$card/device/pp_dpm_sclk" 2>/dev/null | tr -dc '0-9\n' | sort -n | tail -n1)
             fi
             return
         fi
@@ -327,6 +401,8 @@ obtener_datos_gpu() {
                 act=$(cat "$card/gt/gt0/rps_act_freq_mhz" 2>/dev/null)
                 max=$(cat "$card/gt/gt0/rps_max_freq_mhz" 2>/dev/null)
                 [ "${max:-0}" -gt 0 ] && GPU_UTIL=$(( act * 100 / max ))
+                GPU_FREQ_MHZ=$act
+                GPU_FREQ_MAX_MHZ=$max
             fi
             return
         fi
@@ -341,6 +417,26 @@ read_top_processes() {
 
 IA_PATTERNS='ollama|llama|vllm|text-generation|tgi|comfy|stable-diffusion|whisper|transformers|diffusers|exllama|ktransformers|autocg|janus|python|python3'
 
+# Patrón más estricto para el resumen: sin el "python" genérico, que contaría
+# cualquier app de escritorio escrita en Python (blueman, etc.). Las
+# herramientas de IA en Python siguen detectándose por su propio módulo/paquete
+# (p. ej. "python -m vllm..." -> coincide por "vllm").
+IA_SUMMARY_PATTERNS='ollama|llama|vllm|text-generation|tgi|comfy|stable-diffusion|whisper|transformers|diffusers|exllama|ktransformers|autocg|janus'
+
+# --- Resumen de procesos de IA: "<nº> <cpu_total%> <rss_total_kb>" ---
+# Se excluyen los propios procesos del pipeline (ps/awk/grep...) para que el
+# patrón no se detecte a sí mismo en su línea de comandos.
+read_ia_summary() {
+    ps -eo pcpu,rss,cmd 2>/dev/null | awk -v pat="$IA_SUMMARY_PATTERNS" '
+        NR > 1 {
+            if ($3 ~ /^(awk|ps|grep|tail|head|pgrep|sed)$/) next
+            cmd=$3; for (i=4; i<=NF; i++) cmd=cmd " " $i
+            if (cmd ~ pat) { n++; cpu+=$1; rss+=$2 }
+        }
+        END { printf "%d %.1f %d\n", n+0, cpu+0, rss+0 }
+    '
+}
+
 # ---------------------------------------------------------------------------
 # Funciones de dibujo
 # ---------------------------------------------------------------------------
@@ -353,23 +449,61 @@ term_width() {
     fi
 }
 
+# Ancho de barra del modo full: igual para TODAS las métricas del frame.
+# Prefijo compacto (indent 2 + etiqueta 7 + valor 5) y hueco para la columna
+# de datos al final. Se encoge en terminales estrechas para no partir líneas.
+bar_width() {
+    local w bw
+    w=${WIDTH:-$(term_width)}
+    bw=$(( w - 40 ))
+    [ "$bw" -lt 10 ] && bw=10
+    [ "$bw" -gt 48 ] && bw=48
+    printf '%s' "$bw"
+}
+
+# draw_metric <color> <etiqueta> <valor(5)> <pct> [detalle]
+# Formato uniforme de barra: etiqueta, valor, barra (ancho fijo) y detalle
+# numérico alineado al final. El detalle se recorta si no cabe (terminales
+# estrechas) para no partir la línea.
+draw_metric() {
+    local col="$1" label="$2" val="$3" pct="$4" detail="${5:-}"
+    local w avail
+    w=${WIDTH:-$(term_width)}
+    avail=$(( w - BAR_W - 19 ))
+    [ "$avail" -lt 0 ] && avail=0
+    [ "${#detail}" -gt "$avail" ] && detail="${detail:0:$avail}"
+    printf '  %s%-7s%s %s %s%s%s  %s%s%s\n' \
+        "$col" "$label" "$RESET" "$val" \
+        "$col" "$(draw_bar "$pct" "$BAR_W")" "$RESET" \
+        "$DIM" "$detail" "$RESET"
+}
+
+# Línea de separación entre secciones (solo modo simple, texto plano)
+draw_rule() {
+    local w
+    w=$(term_width)
+    [ "$w" -lt 40 ] && w=40
+    printf '%s\n' "$(printf -- '-%.0s' $(seq 1 "$w"))"
+}
+
 draw_header() {
-    local now w
+    local now w up
     now=$(date '+%H:%M:%S')
     w=$(term_width)
+    up=$(read_uptime)
 
     # Colores aleatorios para cada parte del logo
     colores_aleatorios
 
     if [ "$MODE" = "simple" ]; then
-        echo "=== dash4ia | $now | host: $HOSTNAME_VAL | interval: ${INTERVAL}s ==="
+        echo "=== dash4ia v${VERSION} | $now | host: $HOSTNAME_VAL | intervalo ${INTERVAL}s ==="
         return
     fi
 
     # Línea superior estilo dash4me
     printf '%s%s%s\n' "$COLOR_DASH" "─$(printf '─%.0s' $(seq 1 $((w/2))))" "$RESET"
-    printf '%s %s%sDASH4IA%s %s| %sMONITORIA ^_^%s %s| %sV %s%s %s: %s%s%s %s⚡%s\n' \
-        "$COLOR_DASH" "$COLOR_LOGO" "$BOLD" "$RESET" "$COLOR_DASH" "$COLOR_FULL" "$RESET" "$COLOR_DASH" "$COLOR_VER" "$VERSION" "$RESET" "$COLOR_DASH" "$BLANCO" "$now" "$RESET" "$COLOR_RAYO" "$RESET"
+    printf '%s %s%sDASH4IA%s %s| %sMONITORIA ^_^%s %s| %sV %s%s %s: %s%s%s %s| %sup %s%s %s⚡%s\n' \
+        "$COLOR_DASH" "$COLOR_LOGO" "$BOLD" "$RESET" "$COLOR_DASH" "$COLOR_FULL" "$RESET" "$COLOR_DASH" "$COLOR_VER" "$VERSION" "$RESET" "$COLOR_DASH" "$BLANCO" "$now" "$RESET" "$COLOR_DASH" "$DIM" "$up" "$RESET" "$COLOR_RAYO" "$RESET"
     printf '%s%s%s\n' "$COLOR_DASH" "─$(printf '─%.0s' $(seq 1 $((w/2))))" "$RESET"
 
     printf '%s   %sAUTO-REFRESCO:%s %s s%s  |  %sCTRL+C:%s Salir%s\n' \
@@ -377,119 +511,256 @@ draw_header() {
 }
 
 draw_cpu() {
-    local w bar_w pct col cpu_temp tcol
-    w=$(term_width)
-    bar_w=$(( w - 22 ))
-    [ "$bar_w" -lt 10 ] && bar_w=10
-    [ "$bar_w" -gt 40 ] && bar_w=40
-
-    pct=$(read_cpu_total)
-    col=$(color_por_umbral "$pct" 85 60)
+    local cpu_data cpu_pct cpu_temp col tcol
+    cpu_data=$(read_cpu)
+    cpu_pct="${cpu_data%%$'\n'*}"
+    cpu_pct=$(printf '%s' "${cpu_pct:-0}" | tr -dc '0-9')
+    [ -z "$cpu_pct" ] && cpu_pct=0
+    col=$(color_por_umbral "$cpu_pct" 85 60)
     cpu_temp=$(obtener_temp_cpu)
     tcol=$(color_por_umbral "$cpu_temp" 80 65)
 
     if [ "$MODE" = "simple" ]; then
-        echo "--- CPU ---"
-        printf "  %-10s %3d%%  [%s]\n" "CPU total:" "$pct" "$(draw_bar "$pct" "$bar_w")"
-        printf "  %-10s %3d°C [%s]\n" "Temp:" "$cpu_temp" "$(draw_bar "$cpu_temp" "$bar_w")"
-    else
-        printf '%s%s%s\n' "$BOLD$BLUE" "┌─ CPU" "$RESET"
-        printf '  %s%-10s%s %3d%%  %s%s%s\n' "$col" "CPU total:" "$RESET" "$pct" "$col" "$(draw_bar "$pct" "$bar_w")" "$RESET"
-        printf '  %s%-10s%s %3d°C %s%s%s\n' "$tcol" "Temp:" "$RESET" "$cpu_temp" "$tcol" "$(draw_bar "$cpu_temp" "$bar_w")" "$RESET"
-        printf '%s%s%s\n' "$BOLD$BLUE" "└─────────────────────────────" "$RESET"
+        local w bar_w
+        w=$(term_width)
+        bar_w=$(( w - 22 ))
+        [ "$bar_w" -lt 10 ] && bar_w=10
+        [ "$bar_w" -gt 40 ] && bar_w=40
+        # Compacto: una sola línea con uso y temperatura
+        printf 'CPU  %3d%% [%s]  %3d°C\n' "$cpu_pct" "$(draw_bar "$cpu_pct" "$bar_w")" "$cpu_temp"
+        return
     fi
+
+    local cpus l1 l5 l15 load_pct lcol v
+    read -r cpus l1 l5 l15 <<< "$(read_load)"
+
+    printf '%s%s%s\n' "$BOLD$BLUE" "┌─ CPU (${cpus} hilos)" "$RESET"
+    # Carga (primera): barra uniforme con las medias crudas como dato al final
+    if [ "${cpus:-0}" -gt 0 ] 2>/dev/null; then
+        load_pct=$(awk -v l="$l1" -v c="$cpus" 'BEGIN{ printf "%d", (l/c)*100 }')
+        [ "$load_pct" -gt 100 ] && load_pct=100
+        lcol=$(color_por_umbral "$load_pct" 90 70)
+        printf -v v '%4d%%' "$load_pct"
+        draw_metric "$lcol" "Carga:" "$v" "$load_pct" "$l1 / $l5 / $l15"
+    else
+        printf '  %s%-7s%s %s / %s / %s\n' "$DIM" "Carga:" "$RESET" "$l1" "$l5" "$l15"
+    fi
+    printf -v v '%4d%%' "$cpu_pct"
+    draw_metric "$col" "Uso:" "$v" "$cpu_pct"
+    printf -v v '%3d°C' "$cpu_temp"
+    draw_metric "$tcol" "Temp:" "$v" "$cpu_temp"
+    # Núcleos: rejilla de porcentajes con la media como primer valor destacado
+    local cores
+    cores=$(printf '%s\n' "$cpu_data" | tail -n +2)
+    [ -n "$cores" ] && draw_cores "$cores"
+    printf '%s%s%s\n' "$BOLD$BLUE" "└─────────────────────────────" "$RESET"
+}
+
+# draw_cores <porcentajes por núcleo, uno por línea>
+# Rejilla de porcentajes por núcleo (color por umbral), repartida en filas
+# que caben en el ancho del terminal.
+draw_cores() {
+    local pcts=() p
+    while IFS= read -r p; do
+        [ -z "$p" ] && continue
+        pcts+=("$p")
+    done <<< "$1"
+
+    local total=${#pcts[@]}
+    [ "$total" -eq 0 ] && return
+
+    # Media de uso de los núcleos (alineada con los valores de Carga/Uso/Temp)
+    local sum=0 i
+    for (( i=0; i<total; i++ )); do sum=$(( sum + pcts[i] )); done
+    local mean=$(( sum / total ))
+
+    local prefix=15 cell=4 sep=4   # prefijo "  Hilos: 100% " + hueco "  |  "
+    local w avail max_per_row per_row rows
+    w=${WIDTH:-$(term_width)}
+    avail=$(( w - prefix - sep ))
+    max_per_row=$(( avail / (cell + 1) ))
+    [ "$max_per_row" -lt 1 ] && max_per_row=1
+    if [ "$total" -le "$max_per_row" ]; then
+        per_row=$total
+    else
+        # Reparto equilibrado en varias filas (evita una última fila casi vacía)
+        rows=$(( (total + max_per_row - 1) / max_per_row ))
+        per_row=$(( (total + rows - 1) / rows ))
+    fi
+
+    local col
+    for (( i=0; i<total; i++ )); do
+        if [ $(( i % per_row )) -eq 0 ]; then
+            if [ "$i" -eq 0 ]; then
+                printf '  %s%-7s%s %4d%%  %s|%s ' \
+                    "$DIM" "Hilos:" "$RESET" "$mean" "$DIM" "$RESET"
+            else
+                printf '%19s' ''
+            fi
+        fi
+        col=$(color_por_umbral "${pcts[$i]}" 85 60)
+        printf '%s%3d%%%s ' "$col" "${pcts[$i]}" "$RESET"
+        if [ $(( (i + 1) % per_row )) -eq 0 ] || [ "$i" -eq $(( total - 1 )) ]; then
+            printf '\n'
+        fi
+    done
 }
 
 draw_ram() {
-    local total available used pct w bar_w col
+    local total available used pct col v
+    local swap_total swap_used swap_pct scol
     read -r total available used pct <<< "$(read_ram)"
-    w=$(term_width)
-    bar_w=$(( w - 22 ))
-    [ "$bar_w" -lt 10 ] && bar_w=10
-    [ "$bar_w" -gt 40 ] && bar_w=40
+    read -r swap_total swap_used swap_pct <<< "$(read_swap)"
 
     col=$(color_por_umbral "$pct" 85 65)
     if [ "$MODE" = "simple" ]; then
-        echo "--- RAM ---"
-        printf "  %-10s %s / %s (%s%%)\n" "Usada:" "$(human_bytes "$((used*1024))")" "$(human_bytes "$((total*1024))")" "$pct"
-    else
-        printf '%s%s%s\n' "$BOLD$MAGENTA" "┌─ RAM" "$RESET"
-        printf '  %s%-10s%s %3d%%  %s%s%s\n' "$col" "Memoria:" "$RESET" "$pct" "$col" "$(draw_bar "$pct" "$bar_w")" "$RESET"
-        printf '  %s%-10s%s %s / %s (disponible %s)\n' "$DIM" "Usada:" "$RESET" \
-            "$(human_bytes "$((used*1024))")" "$(human_bytes "$((total*1024))")" "$(human_bytes "$((available*1024))")"
-        printf '%s%s%s\n' "$BOLD$MAGENTA" "└─────────────────────────────" "$RESET"
+        local w bar_w
+        w=$(term_width)
+        bar_w=$(( w - 22 ))
+        [ "$bar_w" -lt 10 ] && bar_w=10
+        [ "$bar_w" -gt 40 ] && bar_w=40
+        # Compacto: uso y total en una sola línea, sin línea de "disponible"
+        printf 'RAM  %3d%% [%s]  %s / %s\n' "$pct" "$(draw_bar "$pct" "$bar_w")" \
+            "$(human_bytes "$((used*1024))")" "$(human_bytes "$((total*1024))")"
+        return
     fi
+
+    printf '%s%s%s\n' "$BOLD$MAGENTA" "┌─ Memoria" "$RESET"
+    printf -v v '%4d%%' "$pct"
+    draw_metric "$col" "RAM:" "$v" "$pct" \
+        "$(human_bytes "$((used*1024))") / $(human_bytes "$((total*1024))")"
+    if [ "${swap_total:-0}" -gt 0 ] 2>/dev/null; then
+        scol=$(color_por_umbral "$swap_pct" 85 60)
+        printf -v v '%4d%%' "$swap_pct"
+        draw_metric "$scol" "Swap:" "$v" "$swap_pct" \
+            "$(human_bytes "$((swap_used*1024))") / $(human_bytes "$((swap_total*1024))")"
+    fi
+    printf '%s%s%s\n' "$BOLD$MAGENTA" "└─────────────────────────────" "$RESET"
 }
 
 draw_gpu() {
-    local w bar_w vram_pct vram_avail g_col v_col t_col
-    w=$(term_width)
-    bar_w=$(( w - 22 ))
-    [ "$bar_w" -lt 10 ] && bar_w=10
-    [ "$bar_w" -gt 40 ] && bar_w=40
+    local vram_pct vram_avail g_col v_col t_col v
 
     obtener_datos_gpu
 
-    if [ "$MODE" = "simple" ]; then
-        echo "--- GPU / VRAM ---"
-    else
-        printf '%s%s%s\n' "$BOLD$YELLOW" "┌─ GPU / VRAM" "$RESET"
+    vram_pct=0
+    vram_avail=0
+    if [ "$GPU_MEM_TOTAL_MB" -gt 0 ] 2>/dev/null; then
+        vram_pct=$(awk -v u="$GPU_MEM_USED_MB" -v t="$GPU_MEM_TOTAL_MB" 'BEGIN{ printf "%d", (u/t)*100 }')
+        vram_avail=$(( GPU_MEM_TOTAL_MB - GPU_MEM_USED_MB ))
+        [ "$vram_avail" -lt 0 ] && vram_avail=0
     fi
 
-    if [ "$GPU_TYPE" = "NONE" ]; then
-        if [ "$MODE" = "simple" ]; then
-            echo "  No se detectó GPU dedicada (NVIDIA/AMD/Intel)."
-        else
-            printf '  %sNo se detectó GPU dedicada o faltan controladores.%s\n' "$DIM" "$RESET"
+    # --- Modo simple: una línea por métrica (uso, VRAM, temp y fan) ---
+    if [ "$MODE" = "simple" ]; then
+        local w bar_w
+        w=$(term_width)
+        bar_w=$(( w - 22 ))
+        [ "$bar_w" -lt 10 ] && bar_w=10
+        [ "$bar_w" -gt 40 ] && bar_w=40
+        if [ "$GPU_TYPE" = "NONE" ]; then
+            echo "GPU  No se detectó GPU dedicada (NVIDIA/AMD/Intel)."
+            return
         fi
-    else
+        printf 'GPU  %3d%% [%s]\n' "${GPU_UTIL:-0}" "$(draw_bar "${GPU_UTIL:-0}" "$bar_w")"
         if [ "$GPU_MEM_TOTAL_MB" -gt 0 ] 2>/dev/null; then
-            vram_pct=$(awk -v u="$GPU_MEM_USED_MB" -v t="$GPU_MEM_TOTAL_MB" 'BEGIN{ printf "%d", (u/t)*100 }')
-            vram_avail=$(( GPU_MEM_TOTAL_MB - GPU_MEM_USED_MB ))
-            [ "$vram_avail" -lt 0 ] && vram_avail=0
-        else
-            vram_pct=0
-            vram_avail=0
+            printf 'VRAM %3d%% [%s]  %s/%s MiB\n' "$vram_pct" "$(draw_bar "$vram_pct" "$bar_w")" \
+                "$GPU_MEM_USED_MB" "$GPU_MEM_TOTAL_MB"
         fi
+        if [ "${GPU_TEMP:-0}" -gt 0 ] 2>/dev/null; then
+            printf 'TEMP %3d°C [%s]\n' "$GPU_TEMP" "$(draw_bar "$GPU_TEMP" "$bar_w")"
+        fi
+        if [ -n "$GPU_FAN_STR" ]; then
+            if [ -n "$GPU_FAN_PCT" ]; then
+                printf 'FAN  %3d%% [%s]  %s\n' "$GPU_FAN_PCT" "$(draw_bar "$GPU_FAN_PCT" "$bar_w")" "$GPU_FAN_STR"
+            else
+                echo "FAN  ${GPU_FAN_STR}"
+            fi
+        fi
+        return
+    fi
+
+    printf '%s%s%s\n' "$BOLD$YELLOW" "┌─ GPU / VRAM" "$RESET"
+    if [ "$GPU_TYPE" = "NONE" ]; then
+        printf '  %sNo se detectó GPU dedicada o faltan controladores.%s\n' "$DIM" "$RESET"
+    else
         g_col=$(color_por_umbral "$GPU_UTIL" 85 60)
         v_col=$(color_por_umbral "$vram_pct" 90 70)
         t_col=$(color_por_umbral "$GPU_TEMP" 80 65)
 
-        if [ "$MODE" = "simple" ]; then
-            printf "  %s [%s] : GPU %3s%% | VRAM %s/%s MiB (%3s%%) | %s°C | Fan %s\n" \
-                "$GPU_TYPE" "$GPU_MODEL" "$GPU_UTIL" "$GPU_MEM_USED_MB" "$GPU_MEM_TOTAL_MB" "$vram_pct" "$GPU_TEMP" "${GPU_FAN_STR:-n/d}"
+        printf '  %s%-7s%s %s\n' "$DIM" "Tipo:" "$RESET" "$GPU_TYPE"
+        printf '  %s%-7s%s %s\n' "$DIM" "Modelo:" "$RESET" "$GPU_MODEL"
+
+        local p_col f_col fan_col pow_pct freq_pct fan_detail=""
+
+        # Potencia (primera), uso, VRAM, frecuencia, temperatura y ventilador:
+        # mismo formato; "n/d" si el driver no expone el dato
+        if [ -n "$GPU_POWER_W" ] && [ -n "$GPU_POWER_MAX_W" ] && [ "$GPU_POWER_MAX_W" -gt 0 ] 2>/dev/null; then
+            pow_pct=$(( GPU_POWER_W * 100 / GPU_POWER_MAX_W ))
+            [ "$pow_pct" -gt 100 ] && pow_pct=100
+            p_col=$(color_por_umbral "$pow_pct" 90 70)
+            printf -v v '%4d%%' "$pow_pct"
+            draw_metric "$p_col" "PWR:" "$v" "$pow_pct" "$GPU_POWER_W / $GPU_POWER_MAX_W W"
+        elif [ -n "$GPU_POWER_W" ]; then
+            printf '  %s%-7s%s %s W\n' "$DIM" "PWR:" "$RESET" "$GPU_POWER_W"
         else
-            printf '  %s%-10s%s %s\n' "$DIM" "Tipo:" "$RESET" "$GPU_TYPE"
-            printf '  %s%-10s%s %s\n' "$DIM" "Modelo:" "$RESET" "$GPU_MODEL"
-            if [ "$GPU_MEM_TOTAL_MB" -gt 0 ] 2>/dev/null; then
-                printf '  %s%-10s%s %s MiB / %s MiB (disponible %s MiB)\n' \
-                    "$DIM" "Usada:" "$RESET" "$GPU_MEM_USED_MB" "$GPU_MEM_TOTAL_MB" "$vram_avail"
-            fi
-            printf '  %s%-10s%s %3s%%  %s%s%s\n' "$g_col" "GPU:" "$RESET" "$GPU_UTIL" "$g_col" "$(draw_bar "$GPU_UTIL" "$bar_w")" "$RESET"
-            printf '  %s%-10s%s %3s%%  %s%s%s\n' "$v_col" "VRAM:" "$RESET" "$vram_pct" "$v_col" "$(draw_bar "$vram_pct" "$bar_w")" "$RESET"
-            if [ "$GPU_TEMP" -gt 0 ] 2>/dev/null; then
-                printf '  %s%-10s%s %3d°C %s%s%s\n' "$t_col" "Temp:" "$RESET" "$GPU_TEMP" "$t_col" "$(draw_bar "$GPU_TEMP" "$bar_w")" "$RESET"
-            fi
-            printf '  %s%-10s%s %s\n' "$DIM" "Fan:" "$RESET" "${GPU_FAN_STR:-n/d}"
+            printf '  %s%-7s%s %s\n' "$DIM" "PWR:" "$RESET" "n/d"
+        fi
+        printf -v v '%4d%%' "$GPU_UTIL"
+        draw_metric "$g_col" "GPU:" "$v" "$GPU_UTIL"
+        if [ "$GPU_MEM_TOTAL_MB" -gt 0 ] 2>/dev/null; then
+            printf -v v '%4d%%' "$vram_pct"
+            draw_metric "$v_col" "VRAM:" "$v" "$vram_pct" \
+                "$GPU_MEM_USED_MB / $GPU_MEM_TOTAL_MB MiB"
+        fi
+        if [ -n "$GPU_FREQ_MHZ" ] && [ -n "$GPU_FREQ_MAX_MHZ" ] && [ "$GPU_FREQ_MAX_MHZ" -gt 0 ] 2>/dev/null; then
+            freq_pct=$(( GPU_FREQ_MHZ * 100 / GPU_FREQ_MAX_MHZ ))
+            [ "$freq_pct" -gt 100 ] && freq_pct=100
+            f_col=$(color_por_umbral "$freq_pct" 90 70)
+            printf -v v '%4d%%' "$freq_pct"
+            draw_metric "$f_col" "Frec:" "$v" "$freq_pct" "$GPU_FREQ_MHZ / $GPU_FREQ_MAX_MHZ MHz"
+        elif [ -n "$GPU_FREQ_MHZ" ]; then
+            printf '  %s%-7s%s %s MHz\n' "$DIM" "Frec:" "$RESET" "$GPU_FREQ_MHZ"
+        else
+            printf '  %s%-7s%s %s\n' "$DIM" "Frec:" "$RESET" "n/d"
+        fi
+        if [ "$GPU_TEMP" -gt 0 ] 2>/dev/null; then
+            printf -v v '%3d°C' "$GPU_TEMP"
+            draw_metric "$t_col" "Temp:" "$v" "$GPU_TEMP"
+        fi
+        # Ventilador: barra con el % de giro; las RPM como dato
+        case "$GPU_FAN_STR" in
+            *RPM*) fan_detail="$GPU_FAN_STR" ;;
+        esac
+        if [ -n "$GPU_FAN_PCT" ]; then
+            fan_col=$(color_por_umbral "$GPU_FAN_PCT" 85 65)
+            printf -v v '%4d%%' "$GPU_FAN_PCT"
+            draw_metric "$fan_col" "Fan:" "$v" "$GPU_FAN_PCT" "$fan_detail"
+        elif [ -n "$GPU_FAN_STR" ]; then
+            printf '  %s%-7s%s %s\n' "$DIM" "Fan:" "$RESET" "$GPU_FAN_STR"
+        else
+            printf '  %s%-7s%s %s\n' "$DIM" "Fan:" "$RESET" "n/d"
         fi
     fi
 
-    if [ "$MODE" != "simple" ]; then
-        printf '%s%s%s\n' "$BOLD$YELLOW" "└─────────────────────────────" "$RESET"
-    fi
+    printf '%s%s%s\n' "$BOLD$YELLOW" "└─────────────────────────────" "$RESET"
 }
 
 draw_load() {
-    local load_str cpus l1 l5 l15
+    # Solo modo simple: en full la carga va integrada en la sección CPU
+    local cpus l1 l5 l15 w bar_w l_pct
     read -r cpus l1 l5 l15 <<< "$(read_load)"
-    load_str="$l1 $l5 $l15"
-    if [ "$MODE" = "simple" ]; then
-        echo "--- Carga (load avg 1/5/15 min, CPUs) ---"
-        echo "  $load_str  (CPUs: $cpus)"
+    w=$(term_width)
+    bar_w=$(( w - 22 ))
+    [ "$bar_w" -lt 10 ] && bar_w=10
+    [ "$bar_w" -gt 40 ] && bar_w=40
+    # Barra relativa al número de CPUs (media de 1 min frente a núcleos)
+    if [ "${cpus:-0}" -gt 0 ] 2>/dev/null; then
+        l_pct=$(awk -v l="$l1" -v c="$cpus" 'BEGIN{ printf "%d", (l/c)*100 }')
+        printf 'LOAD %3d%% [%s]  %s %s %s  (CPUs: %s)\n' \
+            "$l_pct" "$(draw_bar "$l_pct" "$bar_w")" "$l1" "$l5" "$l15" "$cpus"
     else
-        printf '%s%s%s\n' "$BOLD$GREEN" "┌─ Carga del sistema" "$RESET"
-        printf '  %sLoad avg :%s %s  (CPUs: %s)\n' "$DIM" "$RESET" "$load_str" "$cpus"
-        printf '%s%s%s\n' "$BOLD$GREEN" "└─────────────────────────────" "$RESET"
+        printf 'LOAD %s %s %s  (CPUs: %s)\n' "$l1" "$l5" "$l15" "$cpus"
     fi
 }
 
@@ -497,8 +768,7 @@ draw_processes() {
     local ps_out line pid user pcpu pmem etime name cmd is_ia pc_col pm_col
 
     if [ "$MODE" = "simple" ]; then
-        echo "--- Procesos principales (por CPU) ---"
-        echo "  PID   USER     %CPU %MEM ETIME    PROCESO"
+        printf 'PROC %-6s %-9s %-5s %-5s %-8s %s\n' "PID" "USER" "%CPU" "%MEM" "ETIME" "PROCESO"
     else
         printf '%s%s%s\n' "$BOLD$CYAN" "┌─ Procesos (top 3 por CPU)" "$RESET"
         printf '  %s%-6s %-9s %-5s %-5s %-8s %s%s\n' "$DIM" "PID" "USER" "%CPU" "%MEM" "ETIME" "PROCESO" "$RESET"
@@ -521,7 +791,7 @@ draw_processes() {
 
         if [ $is_ia -eq 1 ]; then
             if [ "$MODE" = "simple" ]; then
-                printf "  %-6s %-9s %-5s %-5s %-8s %s [IA]\n" "$pid" "$user" "$pcpu" "$pmem" "$etime" "$name"
+                printf "     %-6s %-9s %-5s %-5s %-8s %s [IA]\n" "$pid" "$user" "$pcpu" "$pmem" "$etime" "$name"
             else
                 printf '  %s%-6s %-9s %s%-5s%s %s%-5s%s %s%-8s%s %s%s%s [IA]\n' \
                     "$DIM" "$pid" "$user" "$pc_col" "$pcpu" "$RESET" \
@@ -530,7 +800,7 @@ draw_processes() {
             fi
         else
             if [ "$MODE" = "simple" ]; then
-                printf "  %-6s %-9s %-5s %-5s %-8s %s\n" "$pid" "$user" "$pcpu" "$pmem" "$etime" "$name"
+                printf "     %-6s %-9s %-5s %-5s %-8s %s\n" "$pid" "$user" "$pcpu" "$pmem" "$etime" "$name"
             else
                 printf '  %s%-6s %-9s %s%-5s%s %s%-5s%s %s%-8s%s %s\n' \
                     "$DIM" "$pid" "$user" "$pc_col" "$pcpu" "$RESET" \
@@ -541,6 +811,15 @@ draw_processes() {
     done <<< "$ps_out"
 
     if [ "$MODE" != "simple" ]; then
+        local ia_n ia_cpu ia_rss
+        read -r ia_n ia_cpu ia_rss <<< "$(read_ia_summary)"
+        if [ "${ia_n:-0}" -gt 0 ] 2>/dev/null; then
+            printf '  %s%-7s%s %s%d activos%s  %sCPU %s%%%s  %sRAM %s%s\n' \
+                "$DIM" "IA:" "$RESET" "$BOLD$RED" "$ia_n" "$RESET" \
+                "$DIM" "$ia_cpu" "$RESET" "$DIM" "$(human_bytes "$((ia_rss*1024))")" "$RESET"
+        else
+            printf '  %s%-7s%s %ssin procesos de IA activos%s\n' "$DIM" "IA:" "$RESET" "$DIM" "$RESET"
+        fi
         printf '%s%s%s\n' "$BOLD$CYAN" "└─────────────────────────────" "$RESET"
     fi
 }
@@ -548,7 +827,7 @@ draw_processes() {
 draw_footer() {
     local w info
     if [ "$MODE" = "simple" ]; then
-        echo "=== fin de muestra ==="
+        echo "=== fin ==="
         return
     fi
     w=$(term_width)
@@ -561,19 +840,39 @@ draw_footer() {
 # Renderizado de un frame completo (una sola impresión, sin parpadeo)
 # ---------------------------------------------------------------------------
 render_frame() {
-    local frame
-    frame=$({
-        draw_header
-        draw_cpu
-        draw_ram
-        draw_gpu
-        draw_load
-        draw_processes
-        draw_footer
-    })
-    # Mover cursor al inicio y limpiar hasta el final de la pantalla
-    # (solo al principio del frame; el parpadeo es imperceptible)
-    printf '\033[H\033[J%s' "$frame"
+    local frame clear=''
+
+    if [ "$MODE" = "simple" ]; then
+        frame=$({
+            draw_header
+            draw_rule
+            draw_cpu
+            draw_ram
+            draw_gpu
+            draw_load
+            draw_rule
+            draw_processes
+            draw_footer
+        })
+        # En modo simple sin TTY no se emiten códigos de cursor: salida limpia
+        if [ -t 1 ]; then clear=$'\033[H\033[J'; fi
+    else
+        # Ancho de barra calculado una sola vez por frame (16..100)
+        WIDTH=$(term_width)
+        BAR_W=$(bar_width)
+        frame=$({
+            draw_header
+            draw_gpu
+            draw_ram
+            draw_cpu
+            draw_processes
+            draw_footer
+        })
+        # $'...' para que sean bytes ESC de verdad (con '%s' printf no interpreta \\033)
+        clear=$'\033[H\033[J'
+    fi
+
+    printf '%s%s' "$clear" "$frame"
 }
 
 # ---------------------------------------------------------------------------
@@ -584,12 +883,15 @@ run_once() {
 }
 
 run_loop() {
-    # Pantalla alternativa: guarda el terminal y lo restaura al salir
+    # Pantalla alternativa: guarda el terminal y lo restaura al salir.
+    # Solo en modo full; el modo simple es un flujo de texto plano.
     if [ "$MODE" != "simple" ] && command -v tput >/dev/null 2>&1; then
         tput smcup 2>/dev/null
         tput civis 2>/dev/null
+        trap 'tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; exit 0' SIGINT SIGTERM
+    else
+        trap 'exit 0' SIGINT SIGTERM
     fi
-    trap 'tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; exit 0' SIGINT SIGTERM
 
     while :; do
         render_frame
