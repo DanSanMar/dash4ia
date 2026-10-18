@@ -1,0 +1,23 @@
+# Archivos internos de agentes / asistentes (no forman parte del proyecto)
+AGENTS.md
+CLAUDE.md
+.cursor/
+.opencode/
+.codex/
+
+# Logs y salidas temporales
+*.log
+*.out
+*.tmp
+
+# Copias de seguridad y archivos de editor
+*~
+*.swp
+*.swo
+*.bak
+.vscode/
+.idea/
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db

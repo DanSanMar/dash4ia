@@ -12,7 +12,7 @@ set -u
 # ---------------------------------------------------------------------------
 # Configuración por defecto (sobrescribible por variables de entorno)
 # ---------------------------------------------------------------------------
-VERSION="1.1"
+VERSION="1.2"
 INTERVAL="${DASH4IA_INTERVAL:-2}"
 MODE="${DASH4IA_MODE:-full}"   # full | simple
 ONCE=0
@@ -232,7 +232,7 @@ obtener_datos_gpu() {
     GPU_TYPE="NONE"
     GPU_MODEL="No detectada"
     GPU_TEMP=0
-    GPU_FAN=0
+    GPU_FAN_STR=""
     GPU_MEM_USED_MB=0
     GPU_MEM_TOTAL_MB=0
     GPU_UTIL=0
@@ -247,11 +247,11 @@ obtener_datos_gpu() {
             GPU_TYPE="NVIDIA"
             GPU_MODEL=$(echo "$g_model" | xargs)
             GPU_TEMP=$(echo "$g_temp" | tr -dc '0-9')
-            GPU_FAN=$(echo "$g_fan" | tr -dc '0-9')
+            GPU_FAN_STR="$(echo "$g_fan" | tr -dc '0-9')%"
             GPU_MEM_USED_MB=$(echo "$g_used" | tr -dc '0-9')
             GPU_MEM_TOTAL_MB=$(echo "$g_tot" | tr -dc '0-9')
             GPU_UTIL=$(echo "$g_util" | tr -dc '0-9')
-            : "${GPU_TEMP:=0}" "${GPU_FAN:=0}" "${GPU_MEM_USED_MB:=0}" "${GPU_MEM_TOTAL_MB:=0}" "${GPU_UTIL:=0}"
+            : "${GPU_TEMP:=0}" "${GPU_MEM_USED_MB:=0}" "${GPU_MEM_TOTAL_MB:=0}" "${GPU_UTIL:=0}"
             return
         fi
     fi
@@ -264,9 +264,10 @@ obtener_datos_gpu() {
         if [ "$vendor" = "0x1002" ]; then
             GPU_TYPE="AMD"
             if have lspci; then
-                GPU_MODEL=$(lspci -d 1002: 2>/dev/null | head -n1 \
-                    | sed -E 's/.*VGA compatible controller: AMD\/ATI //; s/.*Display controller: AMD\/ATI //' \
-                    | cut -d'(' -f1 | xargs)
+                # Filtrar por clase real (vga/3d/display): el primer dispositivo AMD suele ser un PCI bridge
+                GPU_MODEL=$(lspci -d 1002: 2>/dev/null | grep -iE 'vga|3d|display' | head -n1 \
+                    | sed -E 's/^[0-9a-f:.]+ [^:]*: //; s/^Advanced Micro Devices, Inc\. \[AMD\/ATI\] //; s/^AMD\/ATI //; s/ *\(rev .*\)$//' \
+                    | xargs)
             fi
             [ -z "$GPU_MODEL" ] && GPU_MODEL="AMD Radeon Graphics"
             if [ -f "$card/device/mem_info_vram_used" ] && [ -f "$card/device/mem_info_vram_total" ]; then
@@ -275,9 +276,22 @@ obtener_datos_gpu() {
             fi
             [ -f "$card/device/gpu_busy_percent" ] && GPU_UTIL=$(cat "$card/device/gpu_busy_percent" 2>/dev/null | tr -dc '0-9')
             if [ -d "$card/device/hwmon" ]; then
-                local hwmon_dir
+                local hwmon_dir fan_rpm pwm pwm_max
                 hwmon_dir=$(ls -d "$card/device/hwmon/hwmon"* 2>/dev/null | head -n 1)
-                [ -n "$hwmon_dir" ] && [ -f "$hwmon_dir/temp1_input" ] && GPU_TEMP=$(( $(cat "$hwmon_dir/temp1_input" 2>/dev/null) / 1000 ))
+                if [ -n "$hwmon_dir" ]; then
+                    [ -f "$hwmon_dir/temp1_input" ] && GPU_TEMP=$(( $(cat "$hwmon_dir/temp1_input" 2>/dev/null) / 1000 ))
+                    # Fan: RPM si el driver lo expone; si no, % de duty (pwm1)
+                    if [ -f "$hwmon_dir/fan1_input" ]; then
+                        fan_rpm=$(cat "$hwmon_dir/fan1_input" 2>/dev/null | tr -dc '0-9')
+                        [ -n "$fan_rpm" ] && GPU_FAN_STR="${fan_rpm} RPM"
+                    fi
+                    if [ -z "$GPU_FAN_STR" ] && [ -f "$hwmon_dir/pwm1" ]; then
+                        pwm=$(cat "$hwmon_dir/pwm1" 2>/dev/null | tr -dc '0-9')
+                        pwm_max=$(cat "$hwmon_dir/pwm1_max" 2>/dev/null | tr -dc '0-9')
+                        : "${pwm_max:=255}"
+                        [ -n "$pwm" ] && [ "$pwm_max" -gt 0 ] && GPU_FAN_STR="$(( pwm * 100 / pwm_max ))%"
+                    fi
+                fi
             fi
             return
         fi
@@ -308,7 +322,8 @@ obtener_datos_gpu() {
 
 # --- Procesos (top 3 por CPU) ---
 read_top_processes() {
-    ps -eo pid,user,pcpu,pmem,etime,cmd --sort=-pcpu 2>/dev/null | head -n 4
+    # comm = nombre corto del ejecutable (para mostrar); cmd = línea completa (para detectar IA)
+    ps -eo pid,user,pcpu,pmem,etime,comm,cmd --sort=-pcpu 2>/dev/null | head -n 4
 }
 
 IA_PATTERNS='ollama|llama|vllm|text-generation|tgi|comfy|stable-diffusion|whisper|transformers|diffusers|exllama|ktransformers|autocg|janus|python|python3'
@@ -327,7 +342,7 @@ term_width() {
 
 draw_header() {
     local now w
-    now=$(date '+%d/%m/%Y %H:%M:%S')
+    now=$(date '+%H:%M:%S')
     w=$(term_width)
 
     # Colores aleatorios para cada parte del logo
@@ -339,17 +354,17 @@ draw_header() {
     fi
 
     # Línea superior estilo dash4me
-    printf '%s%s%s\n' "$COLOR_DASH" "─$(printf '─%.0s' $(seq 1 $((w-2))))" "$RESET"
-    printf '%s %s%sDASH4IA%s %s| %sFULL DASHBOARD%s %s| %sV %s%s %s: %s%s%s %s⚡%s\n' \
+    printf '%s%s%s\n' "$COLOR_DASH" "─$(printf '─%.0s' $(seq 1 $((w/2))))" "$RESET"
+    printf '%s %s%sDASH4IA%s %s| %sMONITORIA ^_^%s %s| %sV %s%s %s: %s%s%s %s⚡%s\n' \
         "$COLOR_DASH" "$COLOR_LOGO" "$BOLD" "$RESET" "$COLOR_DASH" "$COLOR_FULL" "$RESET" "$COLOR_DASH" "$COLOR_VER" "$VERSION" "$RESET" "$COLOR_DASH" "$BLANCO" "$now" "$RESET" "$COLOR_RAYO" "$RESET"
-    printf '%s%s%s\n' "$COLOR_DASH" "─$(printf '─%.0s' $(seq 1 $((w-2))))" "$RESET"
+    printf '%s%s%s\n' "$COLOR_DASH" "─$(printf '─%.0s' $(seq 1 $((w/2))))" "$RESET"
 
     printf '%s   %sAUTO-REFRESCO:%s %s s%s  |  %sCTRL+C:%s Salir%s\n' \
         "$COLOR_DASH" "$RESET" "$CIAN" "$INTERVAL" "$RESET" "$CIAN" "$RESET" "$RESET"
 }
 
 draw_cpu() {
-    local w bar_w pct col
+    local w bar_w pct col cpu_temp tcol
     w=$(term_width)
     bar_w=$(( w - 22 ))
     [ "$bar_w" -lt 10 ] && bar_w=10
@@ -357,13 +372,17 @@ draw_cpu() {
 
     pct=$(read_cpu_total)
     col=$(color_por_umbral "$pct" 85 60)
+    cpu_temp=$(obtener_temp_cpu)
+    tcol=$(color_por_umbral "$cpu_temp" 80 65)
 
     if [ "$MODE" = "simple" ]; then
         echo "--- CPU ---"
-        printf "  CPU total : %3d%%  [%s]\n" "$pct" "$(draw_bar "$pct" "$bar_w")"
+        printf "  %-10s %3d%%  [%s]\n" "CPU total:" "$pct" "$(draw_bar "$pct" "$bar_w")"
+        printf "  %-10s %3d°C [%s]\n" "Temp:" "$cpu_temp" "$(draw_bar "$cpu_temp" "$bar_w")"
     else
         printf '%s%s%s\n' "$BOLD$BLUE" "┌─ CPU" "$RESET"
-        printf '  %sCPU total :%s %3d%%  %s%s%s\n' "$col" "$RESET" "$pct" "$col" "$(draw_bar "$pct" "$bar_w")" "$RESET"
+        printf '  %s%-10s%s %3d%%  %s%s%s\n' "$col" "CPU total:" "$RESET" "$pct" "$col" "$(draw_bar "$pct" "$bar_w")" "$RESET"
+        printf '  %s%-10s%s %3d°C %s%s%s\n' "$tcol" "Temp:" "$RESET" "$cpu_temp" "$tcol" "$(draw_bar "$cpu_temp" "$bar_w")" "$RESET"
         printf '%s%s%s\n' "$BOLD$BLUE" "└─────────────────────────────" "$RESET"
     fi
 }
@@ -379,18 +398,18 @@ draw_ram() {
     col=$(color_por_umbral "$pct" 85 65)
     if [ "$MODE" = "simple" ]; then
         echo "--- RAM ---"
-        printf "  Usada: %s / %s (%s%%)\n" "$(human_bytes "$((used*1024))")" "$(human_bytes "$((total*1024))")" "$pct"
+        printf "  %-10s %s / %s (%s%%)\n" "Usada:" "$(human_bytes "$((used*1024))")" "$(human_bytes "$((total*1024))")" "$pct"
     else
         printf '%s%s%s\n' "$BOLD$MAGENTA" "┌─ RAM" "$RESET"
-        printf '  %sMemoria :%s %3d%%  %s%s%s\n' "$col" "$RESET" "$pct" "$col" "$(draw_bar "$pct" "$bar_w")" "$RESET"
-        printf '  %sUsada   :%s %s / %s (disponible %s)\n' "$DIM" "$RESET" \
+        printf '  %s%-10s%s %3d%%  %s%s%s\n' "$col" "Memoria:" "$RESET" "$pct" "$col" "$(draw_bar "$pct" "$bar_w")" "$RESET"
+        printf '  %s%-10s%s %s / %s (disponible %s)\n' "$DIM" "Usada:" "$RESET" \
             "$(human_bytes "$((used*1024))")" "$(human_bytes "$((total*1024))")" "$(human_bytes "$((available*1024))")"
         printf '%s%s%s\n' "$BOLD$MAGENTA" "└─────────────────────────────" "$RESET"
     fi
 }
 
 draw_gpu() {
-    local w bar_w vram_pct g_col v_col t_col
+    local w bar_w vram_pct vram_avail g_col v_col t_col
     w=$(term_width)
     bar_w=$(( w - 22 ))
     [ "$bar_w" -lt 10 ] && bar_w=10
@@ -413,48 +432,37 @@ draw_gpu() {
     else
         if [ "$GPU_MEM_TOTAL_MB" -gt 0 ] 2>/dev/null; then
             vram_pct=$(awk -v u="$GPU_MEM_USED_MB" -v t="$GPU_MEM_TOTAL_MB" 'BEGIN{ printf "%d", (u/t)*100 }')
+            vram_avail=$(( GPU_MEM_TOTAL_MB - GPU_MEM_USED_MB ))
+            [ "$vram_avail" -lt 0 ] && vram_avail=0
         else
             vram_pct=0
+            vram_avail=0
         fi
         g_col=$(color_por_umbral "$GPU_UTIL" 85 60)
         v_col=$(color_por_umbral "$vram_pct" 90 70)
         t_col=$(color_por_umbral "$GPU_TEMP" 80 65)
 
         if [ "$MODE" = "simple" ]; then
-            printf "  %s [%s] : GPU %3s%% | VRAM %s/%s MiB (%3s%%) | %s°C | Fan %s%%\n" \
-                "$GPU_TYPE" "$GPU_MODEL" "$GPU_UTIL" "$GPU_MEM_USED_MB" "$GPU_MEM_TOTAL_MB" "$vram_pct" "$GPU_TEMP" "$GPU_FAN"
+            printf "  %s [%s] : GPU %3s%% | VRAM %s/%s MiB (%3s%%) | %s°C | Fan %s\n" \
+                "$GPU_TYPE" "$GPU_MODEL" "$GPU_UTIL" "$GPU_MEM_USED_MB" "$GPU_MEM_TOTAL_MB" "$vram_pct" "$GPU_TEMP" "${GPU_FAN_STR:-n/d}"
         else
-            printf '  %sTipo    :%s %s\n' "$DIM" "$RESET" "$GPU_TYPE"
-            printf '  %sModelo  :%s %s\n' "$DIM" "$RESET" "$GPU_MODEL"
-            printf '  %sGPU     :%s %3s%%  %s%s%s\n' "$g_col" "$RESET" "$GPU_UTIL" "$g_col" "$(draw_bar "$GPU_UTIL" "$bar_w")" "$RESET"
-            printf '  %sVRAM    :%s %3s%%  %s%s%s (%s MiB / %s MiB)\n' "$v_col" "$RESET" "$vram_pct" "$v_col" "$(draw_bar "$vram_pct" "$bar_w")" "$RESET" "$GPU_MEM_USED_MB" "$GPU_MEM_TOTAL_MB"
-            if [ "$GPU_TEMP" -gt 0 ] 2>/dev/null; then
-                printf '  %sTemp    :%s %s°C   %sFan:%s %s%%\n' "$t_col" "$RESET" "$GPU_TEMP" "$DIM" "$RESET" "$GPU_FAN"
+            printf '  %s%-10s%s %s\n' "$DIM" "Tipo:" "$RESET" "$GPU_TYPE"
+            printf '  %s%-10s%s %s\n' "$DIM" "Modelo:" "$RESET" "$GPU_MODEL"
+            if [ "$GPU_MEM_TOTAL_MB" -gt 0 ] 2>/dev/null; then
+                printf '  %s%-10s%s %s MiB / %s MiB (disponible %s MiB)\n' \
+                    "$DIM" "Usada:" "$RESET" "$GPU_MEM_USED_MB" "$GPU_MEM_TOTAL_MB" "$vram_avail"
             fi
+            printf '  %s%-10s%s %3s%%  %s%s%s\n' "$g_col" "GPU:" "$RESET" "$GPU_UTIL" "$g_col" "$(draw_bar "$GPU_UTIL" "$bar_w")" "$RESET"
+            printf '  %s%-10s%s %3s%%  %s%s%s\n' "$v_col" "VRAM:" "$RESET" "$vram_pct" "$v_col" "$(draw_bar "$vram_pct" "$bar_w")" "$RESET"
+            if [ "$GPU_TEMP" -gt 0 ] 2>/dev/null; then
+                printf '  %s%-10s%s %3d°C %s%s%s\n' "$t_col" "Temp:" "$RESET" "$GPU_TEMP" "$t_col" "$(draw_bar "$GPU_TEMP" "$bar_w")" "$RESET"
+            fi
+            printf '  %s%-10s%s %s\n' "$DIM" "Fan:" "$RESET" "${GPU_FAN_STR:-n/d}"
         fi
     fi
 
     if [ "$MODE" != "simple" ]; then
         printf '%s%s%s\n' "$BOLD$YELLOW" "└─────────────────────────────" "$RESET"
-    fi
-}
-
-draw_temperatures() {
-    local cpu_temp tcol
-    cpu_temp=$(obtener_temp_cpu)
-    tcol=$(color_por_umbral "$cpu_temp" 80 65)
-
-    if [ "$MODE" = "simple" ]; then
-        echo "--- Temperaturas ---"
-        echo "  CPU: ${cpu_temp}°C"
-    else
-        printf '%s%s%s\n' "$BOLD$RED" "┌─ Temperaturas" "$RESET"
-        printf '  %sCPU:%s %s%s°C%s\n' "$tcol" "$RESET" "$tcol" "$cpu_temp" "$RESET"
-        if [ "$GPU_TYPE" != "NONE" ] && [ "$GPU_TEMP" -gt 0 ] 2>/dev/null; then
-            tcol=$(color_por_umbral "$GPU_TEMP" 80 65)
-            printf '  %sGPU:%s %s%s°C%s\n' "$tcol" "$RESET" "$tcol" "$GPU_TEMP" "$RESET"
-        fi
-        printf '%s%s%s\n' "$BOLD$RED" "└─────────────────────────────" "$RESET"
     fi
 }
 
@@ -473,17 +481,14 @@ draw_load() {
 }
 
 draw_processes() {
-    local w ps_out line pid user pcpu pmem etime cmd is_ia pc_col pm_col cmd_max
-    w=$(term_width)
-    cmd_max=$(( w - 26 ))
-    [ "$cmd_max" -lt 15 ] && cmd_max=15
+    local ps_out line pid user pcpu pmem etime name cmd is_ia pc_col pm_col
 
     if [ "$MODE" = "simple" ]; then
         echo "--- Procesos principales (por CPU) ---"
-        echo "  PID   USER     %CPU %MEM ETIME   CMD"
+        echo "  PID   USER     %CPU %MEM ETIME    PROCESO"
     else
         printf '%s%s%s\n' "$BOLD$CYAN" "┌─ Procesos (top 3 por CPU)" "$RESET"
-        printf '  %s%-6s %-9s %-5s %-5s %-8s %s%s\n' "$DIM" "PID" "USER" "%CPU" "%MEM" "ETIME" "CMD" "$RESET"
+        printf '  %s%-6s %-9s %-5s %-5s %-8s %s%s\n' "$DIM" "PID" "USER" "%CPU" "%MEM" "ETIME" "PROCESO" "$RESET"
     fi
 
     ps_out=$(read_top_processes)
@@ -493,9 +498,7 @@ draw_processes() {
         [ $first -eq 1 ] && { first=0; continue; }
         [ $count -ge 3 ] && break
 
-        read -r pid user pcpu pmem etime _ <<< "$line"
-        cmd=$(echo "$line" | awk '{ $1=$2=$3=$4=$5=$6=""; sub(/^ +/,""); print }')
-        [ ${#cmd} -gt "$cmd_max" ] && cmd="${cmd:0:$((cmd_max-3))}..."
+        read -r pid user pcpu pmem etime name cmd <<< "$line"
 
         is_ia=0
         echo "$cmd" | grep -qiE "$IA_PATTERNS" && is_ia=1
@@ -505,20 +508,20 @@ draw_processes() {
 
         if [ $is_ia -eq 1 ]; then
             if [ "$MODE" = "simple" ]; then
-                printf "  %-6s %-9s %-5s %-5s %-8s %s [IA]\n" "$pid" "$user" "$pcpu" "$pmem" "$etime" "$cmd"
+                printf "  %-6s %-9s %-5s %-5s %-8s %s [IA]\n" "$pid" "$user" "$pcpu" "$pmem" "$etime" "$name"
             else
-                printf '  %s%-6s %-9s %s%-5s%s %s%-5s%s %s%-8s%s %s%s%s[IA]%s\n' \
+                printf '  %s%-6s %-9s %s%-5s%s %s%-5s%s %s%-8s%s %s%s%s [IA]\n' \
                     "$DIM" "$pid" "$user" "$pc_col" "$pcpu" "$RESET" \
                     "$pm_col" "$pmem" "$RESET" "$DIM" "$etime" "$RESET" \
-                    "$BOLD$RED" "$cmd" "$RESET"
+                    "$BOLD$RED" "$name" "$RESET"
             fi
         else
             if [ "$MODE" = "simple" ]; then
-                printf "  %-6s %-9s %-5s %-5s %-8s %s\n" "$pid" "$user" "$pcpu" "$pmem" "$etime" "$cmd"
+                printf "  %-6s %-9s %-5s %-5s %-8s %s\n" "$pid" "$user" "$pcpu" "$pmem" "$etime" "$name"
             else
                 printf '  %s%-6s %-9s %s%-5s%s %s%-5s%s %s%-8s%s %s\n' \
                     "$DIM" "$pid" "$user" "$pc_col" "$pcpu" "$RESET" \
-                    "$pm_col" "$pmem" "$RESET" "$DIM" "$etime" "$RESET" "$cmd"
+                    "$pm_col" "$pmem" "$RESET" "$DIM" "$etime" "$RESET" "$name"
             fi
         fi
         count=$(( count + 1 ))
@@ -538,7 +541,7 @@ draw_footer() {
     w=$(term_width)
     info=" Ctrl+C para salir  |  dash4ia v${VERSION} — monitor de IA local"
     printf '%s%s%s\n' "$DIM" "$info" "$RESET"
-    printf '%s%s%s\n' "$COLOR_DASH" "─$(printf '─%.0s' $(seq 1 $((w-2))))" "$RESET"
+    printf '%s%s%s\n' "$COLOR_DASH" "─$(printf '─%.0s' $(seq 1 $((w/2))))" "$RESET"
 }
 
 # ---------------------------------------------------------------------------
@@ -551,7 +554,6 @@ render_frame() {
         draw_cpu
         draw_ram
         draw_gpu
-        draw_temperatures
         draw_load
         draw_processes
         draw_footer
