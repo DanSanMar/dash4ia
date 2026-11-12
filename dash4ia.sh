@@ -25,7 +25,7 @@ set -u
 # ---------------------------------------------------------------------------
 # Configuración por defecto (sobrescribible por variables de entorno)
 # ---------------------------------------------------------------------------
-VERSION="1.3.1"
+VERSION="1.3.2"
 INTERVAL="${DASH4IA_INTERVAL:-2}"
 MODE="${DASH4IA_MODE:-full}"   # full | simple
 ONCE=0
@@ -455,12 +455,11 @@ term_width() {
 bar_width() {
     local w bw
     w=${WIDTH:-$(term_width)}
-    bw=$(( w - 25 ))             # Menos margen lateral para que sea más larga
+    bw=$(( w - 40 ))
     [ "$bw" -lt 10 ] && bw=10
-    [ "$bw" -gt 90 ] && bw=90   # Nuevo límite máximo ampliado (hasta 90 caracteres)
+    [ "$bw" -gt 48 ] && bw=48   # <-- Este es el límite máximo que frena la barra
     printf '%s' "$bw"
 }
-
 # draw_metric <color> <etiqueta> <valor(5)> <pct> [detalle]
 # Formato uniforme de barra: etiqueta, valor, barra (ancho fijo) y detalle
 # numérico alineado al final. El detalle se recorta si no cabe (terminales
@@ -502,7 +501,7 @@ draw_header() {
 
     # Línea superior estilo dash4me
     printf '%s%s%s\n' "$COLOR_DASH" "─$(printf '─%.0s' $(seq 1 $((w/2))))" "$RESET"
-    printf '%s⚡%s%s %s%sDASH4IA%s %s| %sMONITORIA%s %s^_^%s %s| %sV %s%s %s: %s%s%s %s| %sup %s%s %s⚡%s\n' \
+    printf '%s⚡%s%s %s%sDASH4IA%s %s| %sMONITORIA%s %s^_^%s %s| %sV %s%s%s | %s%s%s %s| %sup %s%s %s⚡%s\n' \
         "$COLOR_RAYO" "$RESET" "$COLOR_DASH" "$COLOR_LOGO" "$BOLD" "$RESET" "$COLOR_DASH" "$COLOR_FULL" "$RESET" "$COLOR_DASH" "$COLOR_VER" "$RESET" "$COLOR_DASH" "$VERSION" "$RESET" "$COLOR_DASH" "$BLANCO" "$now" "$RESET" "$COLOR_DASH" "$DIM" "$up" "$RESET" "$COLOR_RAYO" "$RESET"
     printf '%s%s%s\n' "$COLOR_DASH" "─$(printf '─%.0s' $(seq 1 $((w/2))))" "$RESET"
 
@@ -592,8 +591,8 @@ draw_cores() {
     for (( i=0; i<total; i++ )); do
         if [ $(( i % per_row )) -eq 0 ]; then
             if [ "$i" -eq 0 ]; then
-                printf '  %s%-7s%s %4d%%  %s|%s ' \
-                    "$DIM" "Hilos:" "$RESET" "$mean" "$DIM" "$RESET"
+                printf '  %s%-7s%s %4d%%%s%s' \
+                "$DIM" "Hilos:" "$RESET" "$mean" "$DIM" "$RESET"
             else
                 printf '%19s' ''
             fi
