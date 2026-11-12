@@ -152,7 +152,7 @@ human_bytes() {
         split("B KB MB GB TB PB", u, " ");
         s=1; v=b+0;
         while (v>=1024 && s<7) { v/=1024; s++ }
-        printf "%.2f %s", v, u[s]
+        printf "%.0f %s", v, u[s]
     }'
 }
 
@@ -540,7 +540,7 @@ draw_cpu() {
         [ "$load_pct" -gt 100 ] && load_pct=100
         lcol=$(color_por_umbral "$load_pct" 90 70)
         printf -v v '%4d%%' "$load_pct"
-        draw_metric "$lcol" "Carga:" "$v" "$load_pct" "$l1 / $l5 / $l15"
+        draw_metric "$lcol" "Carga:" "$v" "$load_pct" "$l1 / $l5"
     else
         printf '  %s%-7s%s %s / %s / %s\n' "$DIM" "Carga:" "$RESET" "$l1" "$l5" "$l15"
     fi
@@ -710,7 +710,7 @@ draw_gpu() {
         if [ "$GPU_MEM_TOTAL_MB" -gt 0 ] 2>/dev/null; then
             printf -v v '%4d%%' "$vram_pct"
             draw_metric "$v_col" "VRAM:" "$v" "$vram_pct" \
-                "$GPU_MEM_USED_MB / $GPU_MEM_TOTAL_MB MiB"
+                "$GPU_MEM_USED_MB / $GPU_MEM_TOTAL_MB"
         fi
         if [ -n "$GPU_FREQ_MHZ" ] && [ -n "$GPU_FREQ_MAX_MHZ" ] && [ "$GPU_FREQ_MAX_MHZ" -gt 0 ] 2>/dev/null; then
             freq_pct=$(( GPU_FREQ_MHZ * 100 / GPU_FREQ_MAX_MHZ ))
