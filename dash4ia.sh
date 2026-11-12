@@ -25,7 +25,7 @@ set -u
 # ---------------------------------------------------------------------------
 # Configuración por defecto (sobrescribible por variables de entorno)
 # ---------------------------------------------------------------------------
-VERSION="1.3"
+VERSION="1.3.1"
 INTERVAL="${DASH4IA_INTERVAL:-2}"
 MODE="${DASH4IA_MODE:-full}"   # full | simple
 ONCE=0
@@ -455,9 +455,9 @@ term_width() {
 bar_width() {
     local w bw
     w=${WIDTH:-$(term_width)}
-    bw=$(( w - 40 ))
+    bw=$(( w - 25 ))             # Menos margen lateral para que sea más larga
     [ "$bw" -lt 10 ] && bw=10
-    [ "$bw" -gt 48 ] && bw=48
+    [ "$bw" -gt 90 ] && bw=90   # Nuevo límite máximo ampliado (hasta 90 caracteres)
     printf '%s' "$bw"
 }
 
@@ -502,8 +502,8 @@ draw_header() {
 
     # Línea superior estilo dash4me
     printf '%s%s%s\n' "$COLOR_DASH" "─$(printf '─%.0s' $(seq 1 $((w/2))))" "$RESET"
-    printf '%s %s%sDASH4IA%s %s| %sMONITORIA ^_^%s %s| %sV %s%s %s: %s%s%s %s| %sup %s%s %s⚡%s\n' \
-        "$COLOR_DASH" "$COLOR_LOGO" "$BOLD" "$RESET" "$COLOR_DASH" "$COLOR_FULL" "$RESET" "$COLOR_DASH" "$COLOR_VER" "$VERSION" "$RESET" "$COLOR_DASH" "$BLANCO" "$now" "$RESET" "$COLOR_DASH" "$DIM" "$up" "$RESET" "$COLOR_RAYO" "$RESET"
+    printf '%s⚡%s%s %s%sDASH4IA%s %s| %sMONITORIA%s %s^_^%s %s| %sV %s%s %s: %s%s%s %s| %sup %s%s %s⚡%s\n' \
+        "$COLOR_RAYO" "$RESET" "$COLOR_DASH" "$COLOR_LOGO" "$BOLD" "$RESET" "$COLOR_DASH" "$COLOR_FULL" "$RESET" "$COLOR_DASH" "$COLOR_VER" "$RESET" "$COLOR_DASH" "$VERSION" "$RESET" "$COLOR_DASH" "$BLANCO" "$now" "$RESET" "$COLOR_DASH" "$DIM" "$up" "$RESET" "$COLOR_RAYO" "$RESET"
     printf '%s%s%s\n' "$COLOR_DASH" "─$(printf '─%.0s' $(seq 1 $((w/2))))" "$RESET"
 
     printf '%s   %sAUTO-REFRESCO:%s %s s%s  |  %sCTRL+C:%s Salir%s\n' \
@@ -884,18 +884,25 @@ run_once() {
 
 run_loop() {
     # Pantalla alternativa: guarda el terminal y lo restaura al salir.
-    # Solo en modo full; el modo simple es un flujo de texto plano.
     if [ "$MODE" != "simple" ] && command -v tput >/dev/null 2>&1; then
         tput smcup 2>/dev/null
         tput civis 2>/dev/null
+        # Restaurar terminal y salir al recibir SIGINT o SIGTERM
         trap 'tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; exit 0' SIGINT SIGTERM
     else
         trap 'exit 0' SIGINT SIGTERM
     fi
 
+    # Forzar renderizado inmediato al redimensionar la ventana
+    trap 'render_frame' WINCH
+
     while :; do
         render_frame
-        sleep "$INTERVAL"
+        
+        # Truco con 'read -t' en lugar de 'sleep': 
+        # Si la ventana cambia de tamaño (señal WINCH) o pasa el tiempo, 
+        # 'read' se desbloquea al instante permitiendo repintar de inmediato.
+        read -r -t "$INTERVAL" < /dev/tty || true
     done
 }
 
